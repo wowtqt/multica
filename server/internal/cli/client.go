@@ -9,16 +9,41 @@ import (
 	"mime/multipart"
 	"net/http"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
 
+// ClientVersion is the CLI version sent on every request as X-Client-Version.
+// Set by the multica binary at init() so the package doesn't depend on the
+// concrete cmd package. Defaults to "dev" when running unset (e.g. tests).
+var ClientVersion = "dev"
+
+// ClientPlatform identifies this client to the server. Override for tests
+// or alternative entry points; defaults to "cli".
+var ClientPlatform = "cli"
+
+// ClientOS is the normalized operating system string sent as X-Client-OS.
+// Computed once from runtime.GOOS so the server doesn't need to reverse-map
+// Go's os names ("darwin"/"windows"/"linux") into the protocol vocabulary.
+var ClientOS = normalizeGOOS(runtime.GOOS)
+
+func normalizeGOOS(goos string) string {
+	switch goos {
+	case "darwin":
+		return "macos"
+	case "windows":
+		return "windows"
+	case "linux":
+		return "linux"
+	default:
+		return goos
+	}
+}
+
 // APIClient is a REST client for the Multica server API.
-// Used by ctrl subcommands (agent, runtime, status, etc.).
-//
-// TODO: Add Authorization header support. Agent routes (/api/agents/...)
-// require JWT auth via middleware.Auth, but this client currently sends
-// no auth token. CLI agent commands will fail with 401 until this is added.
+// Used by ctrl subcommands (agent, runtime, status, etc.). Requests
+// automatically include auth and execution context headers when configured.
 type APIClient struct {
 	BaseURL     string
 	WorkspaceID string
@@ -26,6 +51,12 @@ type APIClient struct {
 	AgentID     string // When set, requests are attributed to this agent instead of the user.
 	TaskID      string // When set, sent as X-Task-ID for agent-task validation.
 	HTTPClient  *http.Client
+
+	// Identity overrides. Empty values fall back to the package-level
+	// ClientPlatform / ClientVersion / ClientOS.
+	Platform string
+	Version  string
+	OS       string
 }
 
 // NewAPIClient creates a new API client for ctrl commands.
@@ -50,6 +81,28 @@ func (c *APIClient) setHeaders(req *http.Request) {
 	}
 	if c.TaskID != "" {
 		req.Header.Set("X-Task-ID", c.TaskID)
+	}
+
+	platform := c.Platform
+	if platform == "" {
+		platform = ClientPlatform
+	}
+	if platform != "" {
+		req.Header.Set("X-Client-Platform", platform)
+	}
+	version := c.Version
+	if version == "" {
+		version = ClientVersion
+	}
+	if version != "" {
+		req.Header.Set("X-Client-Version", version)
+	}
+	osName := c.OS
+	if osName == "" {
+		osName = ClientOS
+	}
+	if osName != "" {
+		req.Header.Set("X-Client-OS", osName)
 	}
 }
 
@@ -186,6 +239,36 @@ func (c *APIClient) PutJSON(ctx context.Context, path string, body any, out any)
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
+// PatchJSON performs a PATCH request with a JSON body.
+func (c *APIClient) PatchJSON(ctx context.Context, path string, body any, out any) error {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, c.BaseURL+path, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.setHeaders(req)
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		respData, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("PATCH %s returned %d: %s", path, resp.StatusCode, strings.TrimSpace(string(respData)))
+	}
+	if out == nil {
+		return nil
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
 // UploadFile uploads a file via multipart form to /api/upload-file.
 // It returns the attachment ID from the server response.
 func (c *APIClient) UploadFile(ctx context.Context, fileData []byte, filename string, issueID string) (string, error) {
@@ -243,10 +326,27 @@ func (c *APIClient) UploadFile(ctx context.Context, fileData []byte, filename st
 // DownloadFile downloads a file from the given URL and returns the response body.
 // This is used for downloading attachments via their signed download_url.
 // Downloads are limited to 100 MB to match the upload size limit.
+//
+// The URL may be absolute (a signed CloudFront/S3 URL) or relative
+// (a server-relative path like "/uploads/...") depending on how the
+// server is configured. Relative URLs are resolved against the client's
+// BaseURL and sent with the standard auth headers; absolute URLs are
+// used as-is so that their query-string signatures are not disturbed.
 func (c *APIClient) DownloadFile(ctx context.Context, downloadURL string) ([]byte, error) {
+	isRelative := !strings.HasPrefix(downloadURL, "http://") && !strings.HasPrefix(downloadURL, "https://")
+	if isRelative {
+		if c.BaseURL == "" {
+			return nil, fmt.Errorf("download URL %q is relative but client has no BaseURL", downloadURL)
+		}
+		downloadURL = c.BaseURL + downloadURL
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
 	if err != nil {
 		return nil, err
+	}
+	if isRelative {
+		c.setHeaders(req)
 	}
 
 	resp, err := c.HTTPClient.Do(req)

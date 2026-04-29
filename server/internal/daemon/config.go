@@ -8,52 +8,67 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/mattn/go-shellwords"
 )
 
 const (
-	DefaultServerURL             = "ws://localhost:8080/ws"
-	DefaultPollInterval          = 3 * time.Second
-	DefaultHeartbeatInterval     = 15 * time.Second
-	DefaultAgentTimeout          = 2 * time.Hour
-	DefaultRuntimeName           = "Local Agent"
-	DefaultConfigReloadInterval  = 5 * time.Second
-	DefaultWorkspaceSyncInterval = 30 * time.Second
-	DefaultHealthPort            = 19514
-	DefaultMaxConcurrentTasks    = 20
+	DefaultServerURL                      = "ws://localhost:8080/ws"
+	DefaultPollInterval                   = 30 * time.Second
+	DefaultHeartbeatInterval              = 15 * time.Second
+	DefaultAgentTimeout                   = 2 * time.Hour
+	DefaultCodexSemanticInactivityTimeout = 10 * time.Minute
+	DefaultRuntimeName                    = "Local Agent"
+	DefaultWorkspaceSyncInterval          = 30 * time.Second
+	DefaultHealthPort                     = 19514
+	DefaultMaxConcurrentTasks             = 20
+	DefaultGCInterval                     = 1 * time.Hour
+	DefaultGCTTL                          = 24 * time.Hour // 1 day — AI-coding issues rarely stay open long
+	DefaultGCOrphanTTL                    = 72 * time.Hour // 3 days — orphans with no meta (crashes, pre-GC leftovers)
 )
 
 // Config holds all daemon configuration.
 type Config struct {
-	ServerBaseURL      string
-	DaemonID           string
-	DeviceName         string
-	RuntimeName        string
-	CLIVersion         string                // multica CLI version (e.g. "0.1.13")
-	Profile            string                // profile name (empty = default)
-	Agents             map[string]AgentEntry // "claude" -> entry, "codex" -> entry, "opencode" -> entry, "openclaw" -> entry, "hermes" -> entry
-	WorkspacesRoot     string                // base path for execution envs (default: ~/multica_workspaces)
-	KeepEnvAfterTask   bool                  // preserve env after task for debugging
-	HealthPort         int                   // local HTTP port for health checks (default: 19514)
-	MaxConcurrentTasks int                   // max tasks running in parallel (default: 20)
-	PollInterval       time.Duration
-	HeartbeatInterval  time.Duration
-	AgentTimeout       time.Duration
+	ServerBaseURL                  string
+	DaemonID                       string
+	LegacyDaemonIDs                []string // historical daemon_ids this machine may have registered under; reported at register time so the server can merge old runtime rows
+	DeviceName                     string
+	RuntimeName                    string
+	CLIVersion                     string                // multica CLI version (e.g. "0.1.13")
+	LaunchedBy                     string                // "desktop" when spawned by the Electron app, empty for standalone
+	Profile                        string                // profile name (empty = default)
+	Agents                         map[string]AgentEntry // keyed by provider: claude, codex, copilot, opencode, openclaw, hermes, gemini, pi, cursor, kimi, kiro
+	WorkspacesRoot                 string                // base path for execution envs (default: ~/multica_workspaces)
+	KeepEnvAfterTask               bool                  // preserve env after task for debugging
+	HealthPort                     int                   // local HTTP port for health checks (default: 19514)
+	MaxConcurrentTasks             int                   // max tasks running in parallel (default: 20)
+	GCEnabled                      bool                  // enable periodic workspace garbage collection (default: true)
+	GCInterval                     time.Duration         // how often the GC loop runs (default: 1h)
+	GCTTL                          time.Duration         // clean dirs whose issue is done/canceled and updated_at < now()-TTL (default: 24h)
+	GCOrphanTTL                    time.Duration         // clean orphan dirs with no meta older than this (default: 72h). Dirs whose issue returned 404 are cleaned immediately.
+	PollInterval                   time.Duration
+	HeartbeatInterval              time.Duration
+	AgentTimeout                   time.Duration
+	CodexSemanticInactivityTimeout time.Duration
+	ClaudeArgs                     []string
+	CodexArgs                      []string
 }
 
 // Overrides allows CLI flags to override environment variables and defaults.
 // Zero values are ignored and the env/default value is used instead.
 type Overrides struct {
-	ServerURL          string
-	WorkspacesRoot     string
-	PollInterval       time.Duration
-	HeartbeatInterval  time.Duration
-	AgentTimeout       time.Duration
-	MaxConcurrentTasks int
-	DaemonID           string
-	DeviceName         string
-	RuntimeName        string
-	Profile            string // profile name (empty = default)
-	HealthPort         int    // health check port (0 = use default)
+	ServerURL                      string
+	WorkspacesRoot                 string
+	PollInterval                   time.Duration
+	HeartbeatInterval              time.Duration
+	AgentTimeout                   time.Duration
+	CodexSemanticInactivityTimeout time.Duration
+	MaxConcurrentTasks             int
+	DaemonID                       string
+	DeviceName                     string
+	RuntimeName                    string
+	Profile                        string // profile name (empty = default)
+	HealthPort                     int    // health check port (0 = use default)
 }
 
 // LoadConfig builds the daemon configuration from environment variables
@@ -106,8 +121,59 @@ func LoadConfig(overrides Overrides) (Config, error) {
 			Model: strings.TrimSpace(os.Getenv("MULTICA_HERMES_MODEL")),
 		}
 	}
+	geminiPath := envOrDefault("MULTICA_GEMINI_PATH", "gemini")
+	if _, err := exec.LookPath(geminiPath); err == nil {
+		agents["gemini"] = AgentEntry{
+			Path:  geminiPath,
+			Model: strings.TrimSpace(os.Getenv("MULTICA_GEMINI_MODEL")),
+		}
+	}
+	piPath := envOrDefault("MULTICA_PI_PATH", "pi")
+	if _, err := exec.LookPath(piPath); err == nil {
+		agents["pi"] = AgentEntry{
+			Path:  piPath,
+			Model: strings.TrimSpace(os.Getenv("MULTICA_PI_MODEL")),
+		}
+	}
+	cursorPath := envOrDefault("MULTICA_CURSOR_PATH", "cursor-agent")
+	if _, err := exec.LookPath(cursorPath); err == nil {
+		agents["cursor"] = AgentEntry{
+			Path:  cursorPath,
+			Model: strings.TrimSpace(os.Getenv("MULTICA_CURSOR_MODEL")),
+		}
+	}
+	copilotPath := envOrDefault("MULTICA_COPILOT_PATH", "copilot")
+	if _, err := exec.LookPath(copilotPath); err == nil {
+		agents["copilot"] = AgentEntry{
+			Path:  copilotPath,
+			Model: strings.TrimSpace(os.Getenv("MULTICA_COPILOT_MODEL")),
+		}
+	}
+	kimiPath := envOrDefault("MULTICA_KIMI_PATH", "kimi")
+	if _, err := exec.LookPath(kimiPath); err == nil {
+		agents["kimi"] = AgentEntry{
+			Path:  kimiPath,
+			Model: strings.TrimSpace(os.Getenv("MULTICA_KIMI_MODEL")),
+		}
+	}
+	kiroPath := envOrDefault("MULTICA_KIRO_PATH", "kiro-cli")
+	if _, err := exec.LookPath(kiroPath); err == nil {
+		agents["kiro"] = AgentEntry{
+			Path:  kiroPath,
+			Model: strings.TrimSpace(os.Getenv("MULTICA_KIRO_MODEL")),
+		}
+	}
 	if len(agents) == 0 {
-		return Config{}, fmt.Errorf("no agent CLI found: install claude, codex, opencode, openclaw, or hermes and ensure it is on PATH")
+		return Config{}, fmt.Errorf("no agent CLI found: install claude, codex, copilot, opencode, openclaw, hermes, gemini, pi, cursor-agent, kimi, or kiro-cli and ensure it is on PATH")
+	}
+
+	claudeArgs, err := shellArgsFromEnv("MULTICA_CLAUDE_ARGS")
+	if err != nil {
+		return Config{}, err
+	}
+	codexArgs, err := shellArgsFromEnv("MULTICA_CODEX_ARGS")
+	if err != nil {
+		return Config{}, err
 	}
 
 	// Host info
@@ -141,6 +207,14 @@ func LoadConfig(overrides Overrides) (Config, error) {
 		agentTimeout = overrides.AgentTimeout
 	}
 
+	codexSemanticInactivityTimeout, err := durationFromEnv("MULTICA_CODEX_SEMANTIC_INACTIVITY_TIMEOUT", DefaultCodexSemanticInactivityTimeout)
+	if err != nil {
+		return Config{}, err
+	}
+	if overrides.CodexSemanticInactivityTimeout > 0 {
+		codexSemanticInactivityTimeout = overrides.CodexSemanticInactivityTimeout
+	}
+
 	maxConcurrentTasks, err := intFromEnv("MULTICA_DAEMON_MAX_CONCURRENT_TASKS", DefaultMaxConcurrentTasks)
 	if err != nil {
 		return Config{}, err
@@ -152,16 +226,40 @@ func LoadConfig(overrides Overrides) (Config, error) {
 	// Profile
 	profile := overrides.Profile
 
-	// String overrides
-	daemonID := envOrDefault("MULTICA_DAEMON_ID", host)
+	// daemon_id resolution: override > env > persistent UUID on disk.
+	// The persistent UUID is written once to `<profile-dir>/daemon.id` and
+	// then reused forever so hostname drift (.local suffix, system rename,
+	// mDNS state, profile switch) no longer mints a new runtime identity.
+	// Callers may still pin a specific id via MULTICA_DAEMON_ID or the
+	// override field (e.g. for tests or embedded environments).
+	daemonID := strings.TrimSpace(os.Getenv("MULTICA_DAEMON_ID"))
 	if overrides.DaemonID != "" {
 		daemonID = overrides.DaemonID
 	}
-	// Suffix daemon ID with profile name to avoid collisions when multiple
-	// daemons register against the same server.
-	if profile != "" && !strings.HasSuffix(daemonID, "-"+profile) {
-		daemonID = daemonID + "-" + profile
+	if daemonID == "" {
+		persisted, err := EnsureDaemonID(profile)
+		if err != nil {
+			return Config{}, fmt.Errorf("ensure daemon id: %w", err)
+		}
+		daemonID = persisted
 	}
+	// Historical daemon_ids derived from the current hostname/profile. The
+	// server uses these at register time to merge any pre-UUID runtime rows
+	// for this machine into the new UUID-keyed row and delete the stale ones.
+	legacyDaemonIDs := LegacyDaemonIDs(host, profile)
+	// Pre-change (#1220) daemon identity was stored per profile, which means
+	// the same machine could end up with multiple leftover daemon.id files
+	// — e.g. ~/.multica/daemon.id (default) plus ~/.multica/profiles/<x>/
+	// daemon.id. Surface those UUIDs so the server can merge their runtime
+	// rows into the canonical machine UUID. Fatal-free: a broken profiles
+	// dir shouldn't block startup.
+	if uuids, err := LegacyDaemonUUIDs(); err == nil {
+		legacyDaemonIDs = append(legacyDaemonIDs, uuids...)
+	}
+	// Strip anything that collides with the resolved daemon_id (e.g. when
+	// the user explicitly pins MULTICA_DAEMON_ID=<hostname>, or when the
+	// canonical id was itself promoted from a pre-change profile file).
+	legacyDaemonIDs = filterLegacyIDs(legacyDaemonIDs, daemonID)
 
 	deviceName := envOrDefault("MULTICA_DAEMON_DEVICE_NAME", host)
 	if overrides.DeviceName != "" {
@@ -203,20 +301,46 @@ func LoadConfig(overrides Overrides) (Config, error) {
 	// Keep env after task: env > default (false)
 	keepEnv := os.Getenv("MULTICA_KEEP_ENV_AFTER_TASK") == "true" || os.Getenv("MULTICA_KEEP_ENV_AFTER_TASK") == "1"
 
+	// GC config: env > defaults
+	gcEnabled := true
+	if v := os.Getenv("MULTICA_GC_ENABLED"); v == "false" || v == "0" {
+		gcEnabled = false
+	}
+	gcInterval, err := durationFromEnv("MULTICA_GC_INTERVAL", DefaultGCInterval)
+	if err != nil {
+		return Config{}, err
+	}
+	gcTTL, err := durationFromEnv("MULTICA_GC_TTL", DefaultGCTTL)
+	if err != nil {
+		return Config{}, err
+	}
+	gcOrphanTTL, err := durationFromEnv("MULTICA_GC_ORPHAN_TTL", DefaultGCOrphanTTL)
+	if err != nil {
+		return Config{}, err
+	}
+
 	return Config{
-		ServerBaseURL:      serverBaseURL,
-		DaemonID:           daemonID,
-		DeviceName:         deviceName,
-		RuntimeName:        runtimeName,
-		Profile:            profile,
-		Agents:             agents,
-		WorkspacesRoot:     workspacesRoot,
-		KeepEnvAfterTask:   keepEnv,
-		HealthPort:         healthPort,
-		MaxConcurrentTasks: maxConcurrentTasks,
-		PollInterval:       pollInterval,
-		HeartbeatInterval:  heartbeatInterval,
-		AgentTimeout:       agentTimeout,
+		ServerBaseURL:                  serverBaseURL,
+		DaemonID:                       daemonID,
+		LegacyDaemonIDs:                legacyDaemonIDs,
+		DeviceName:                     deviceName,
+		RuntimeName:                    runtimeName,
+		Profile:                        profile,
+		Agents:                         agents,
+		WorkspacesRoot:                 workspacesRoot,
+		KeepEnvAfterTask:               keepEnv,
+		GCEnabled:                      gcEnabled,
+		GCInterval:                     gcInterval,
+		GCTTL:                          gcTTL,
+		GCOrphanTTL:                    gcOrphanTTL,
+		HealthPort:                     healthPort,
+		MaxConcurrentTasks:             maxConcurrentTasks,
+		PollInterval:                   pollInterval,
+		HeartbeatInterval:              heartbeatInterval,
+		AgentTimeout:                   agentTimeout,
+		CodexSemanticInactivityTimeout: codexSemanticInactivityTimeout,
+		ClaudeArgs:                     claudeArgs,
+		CodexArgs:                      codexArgs,
 	}, nil
 }
 
@@ -242,4 +366,16 @@ func NormalizeServerBaseURL(raw string) (string, error) {
 	u.RawQuery = ""
 	u.Fragment = ""
 	return strings.TrimRight(u.String(), "/"), nil
+}
+
+func shellArgsFromEnv(name string) ([]string, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return nil, nil
+	}
+	args, err := shellwords.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid %s: %w", name, err)
+	}
+	return args, nil
 }

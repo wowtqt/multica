@@ -9,9 +9,12 @@ import {
   CircleDot,
   Columns3,
   Filter,
+  FolderKanban,
+  FolderMinus,
   List,
   SignalHigh,
   SlidersHorizontal,
+  Tag,
   User,
   UserMinus,
   UserPen,
@@ -46,7 +49,11 @@ import { StatusIcon, PriorityIcon } from ".";
 import { useQuery } from "@tanstack/react-query";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { memberListOptions, agentListOptions } from "@multica/core/workspace/queries";
+import { projectListOptions } from "@multica/core/projects/queries";
+import { labelListOptions } from "@multica/core/labels/queries";
+import { ProjectIcon } from "../../projects/components/project-icon";
 import { ActorAvatar } from "../../common/actor-avatar";
+import { LabelChip } from "../../labels/label-chip";
 import {
   SORT_OPTIONS,
   CARD_PROPERTY_OPTIONS,
@@ -88,12 +95,17 @@ function getActiveFilterCount(state: {
   assigneeFilters: ActorFilterValue[];
   includeNoAssignee: boolean;
   creatorFilters: ActorFilterValue[];
+  projectFilters: string[];
+  includeNoProject: boolean;
+  labelFilters: string[];
 }) {
   let count = 0;
   if (state.statusFilters.length > 0) count++;
   if (state.priorityFilters.length > 0) count++;
   if (state.assigneeFilters.length > 0 || state.includeNoAssignee) count++;
   if (state.creatorFilters.length > 0) count++;
+  if (state.projectFilters.length > 0 || state.includeNoProject) count++;
+  if (state.labelFilters.length > 0) count++;
   return count;
 }
 
@@ -103,7 +115,10 @@ function useIssueCounts(allIssues: Issue[]) {
     const priority = new Map<string, number>();
     const assignee = new Map<string, number>();
     const creator = new Map<string, number>();
+    const project = new Map<string, number>();
+    const label = new Map<string, number>();
     let noAssignee = 0;
+    let noProject = 0;
 
     for (const issue of allIssues) {
       status.set(issue.status, (status.get(issue.status) ?? 0) + 1);
@@ -118,9 +133,21 @@ function useIssueCounts(allIssues: Issue[]) {
 
       const cKey = `${issue.creator_type}:${issue.creator_id}`;
       creator.set(cKey, (creator.get(cKey) ?? 0) + 1);
+
+      if (!issue.project_id) {
+        noProject++;
+      } else {
+        project.set(issue.project_id, (project.get(issue.project_id) ?? 0) + 1);
+      }
+
+      if (issue.labels) {
+        for (const l of issue.labels) {
+          label.set(l.id, (label.get(l.id) ?? 0) + 1);
+        }
+      }
     }
 
-    return { status, priority, assignee, creator, noAssignee };
+    return { status, priority, assignee, creator, noAssignee, project, noProject, label };
   }, [allIssues]);
 }
 
@@ -159,7 +186,7 @@ function ActorSubContent({
   const wsId = useWorkspaceId();
   const { data: members = [] } = useQuery(memberListOptions(wsId));
   const { data: agents = [] } = useQuery(agentListOptions(wsId));
-  const query = search.toLowerCase();
+  const query = search.trim().toLowerCase();
   const filteredMembers = members.filter((m) =>
     m.name.toLowerCase().includes(query),
   );
@@ -247,7 +274,7 @@ function ActorSubContent({
                   className={FILTER_ITEM_CLASS}
                 >
                   <HoverCheck checked={checked} />
-                  <ActorAvatar actorType="agent" actorId={a.id} size={18} />
+                  <ActorAvatar actorType="agent" actorId={a.id} size={18} showStatusDot />
                   <span className="truncate">{a.name}</span>
                   {count > 0 && (
                     <span className="ml-auto text-xs text-muted-foreground">
@@ -271,6 +298,160 @@ function ActorSubContent({
 }
 
 // ---------------------------------------------------------------------------
+// Project sub-menu content
+// ---------------------------------------------------------------------------
+
+function ProjectSubContent({
+  counts,
+  selected,
+  onToggle,
+  includeNoProject,
+  onToggleNoProject,
+  noProjectCount,
+}: {
+  counts: Map<string, number>;
+  selected: string[];
+  onToggle: (projectId: string) => void;
+  includeNoProject: boolean;
+  onToggleNoProject: () => void;
+  noProjectCount: number;
+}) {
+  const [search, setSearch] = useState("");
+  const wsId = useWorkspaceId();
+  const { data: projects = [] } = useQuery(projectListOptions(wsId));
+  const query = search.trim().toLowerCase();
+  const filtered = projects.filter((p) =>
+    p.title.toLowerCase().includes(query),
+  );
+
+  return (
+    <>
+      <div className="px-2 py-1.5 border-b border-foreground/5">
+        <input
+          type="text"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Filter..."
+          className="w-full bg-transparent text-sm placeholder:text-muted-foreground outline-none"
+          autoFocus
+        />
+      </div>
+
+      <div className="max-h-64 overflow-y-auto p-1">
+        {(!query || "no project".includes(query) || "unassigned".includes(query)) && (
+          <DropdownMenuCheckboxItem
+            checked={includeNoProject}
+            onCheckedChange={() => onToggleNoProject()}
+            className={FILTER_ITEM_CLASS}
+          >
+            <HoverCheck checked={includeNoProject} />
+            <FolderMinus className="size-3.5 text-muted-foreground" />
+            No project
+            {noProjectCount > 0 && (
+              <span className="ml-auto text-xs text-muted-foreground">
+                {noProjectCount}
+              </span>
+            )}
+          </DropdownMenuCheckboxItem>
+        )}
+
+        {filtered.map((p) => {
+          const checked = selected.includes(p.id);
+          const count = counts.get(p.id) ?? 0;
+          return (
+            <DropdownMenuCheckboxItem
+              key={p.id}
+              checked={checked}
+              onCheckedChange={() => onToggle(p.id)}
+              className={FILTER_ITEM_CLASS}
+            >
+              <HoverCheck checked={checked} />
+              <ProjectIcon project={p} size="sm" />
+              <span className="truncate">{p.title}</span>
+              {count > 0 && (
+                <span className="ml-auto text-xs text-muted-foreground">
+                  {count}
+                </span>
+              )}
+            </DropdownMenuCheckboxItem>
+          );
+        })}
+
+        {filtered.length === 0 && search && (
+          <div className="px-2 py-3 text-center text-sm text-muted-foreground">
+            No results
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Label sub-menu content
+// ---------------------------------------------------------------------------
+
+function LabelSubContent({
+  counts,
+  selected,
+  onToggle,
+}: {
+  counts: Map<string, number>;
+  selected: string[];
+  onToggle: (labelId: string) => void;
+}) {
+  const [search, setSearch] = useState("");
+  const wsId = useWorkspaceId();
+  const { data: labels = [] } = useQuery(labelListOptions(wsId));
+  const query = search.trim().toLowerCase();
+  const filtered = labels.filter((l) => l.name.toLowerCase().includes(query));
+
+  return (
+    <>
+      <div className="px-2 py-1.5 border-b border-foreground/5">
+        <input
+          type="text"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Filter..."
+          className="w-full bg-transparent text-sm placeholder:text-muted-foreground outline-none"
+          autoFocus
+        />
+      </div>
+
+      <div className="max-h-64 overflow-y-auto p-1">
+        {filtered.map((l) => {
+          const checked = selected.includes(l.id);
+          const count = counts.get(l.id) ?? 0;
+          return (
+            <DropdownMenuCheckboxItem
+              key={l.id}
+              checked={checked}
+              onCheckedChange={() => onToggle(l.id)}
+              className={FILTER_ITEM_CLASS}
+            >
+              <HoverCheck checked={checked} />
+              <LabelChip label={l} />
+              {count > 0 && (
+                <span className="ml-auto text-xs text-muted-foreground">
+                  {count}
+                </span>
+              )}
+            </DropdownMenuCheckboxItem>
+          );
+        })}
+
+        {filtered.length === 0 && (
+          <div className="px-2 py-3 text-center text-sm text-muted-foreground">
+            {search ? "No results" : "No labels yet"}
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // IssuesHeader
 // ---------------------------------------------------------------------------
 
@@ -284,6 +465,9 @@ export function IssuesHeader({ scopedIssues }: { scopedIssues: Issue[] }) {
   const assigneeFilters = useViewStore((s) => s.assigneeFilters);
   const includeNoAssignee = useViewStore((s) => s.includeNoAssignee);
   const creatorFilters = useViewStore((s) => s.creatorFilters);
+  const projectFilters = useViewStore((s) => s.projectFilters);
+  const includeNoProject = useViewStore((s) => s.includeNoProject);
+  const labelFilters = useViewStore((s) => s.labelFilters);
   const sortBy = useViewStore((s) => s.sortBy);
   const sortDirection = useViewStore((s) => s.sortDirection);
   const cardProperties = useViewStore((s) => s.cardProperties);
@@ -298,6 +482,9 @@ export function IssuesHeader({ scopedIssues }: { scopedIssues: Issue[] }) {
       assigneeFilters,
       includeNoAssignee,
       creatorFilters,
+      projectFilters,
+      includeNoProject,
+      labelFilters,
     }) > 0;
 
   const sortLabel =
@@ -464,6 +651,49 @@ export function IssuesHeader({ scopedIssues }: { scopedIssues: Issue[] }) {
                   counts={counts.creator}
                   selected={creatorFilters}
                   onToggle={act.toggleCreatorFilter}
+                />
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
+
+            {/* Project */}
+            <DropdownMenuSub>
+              <DropdownMenuSubTrigger>
+                <FolderKanban className="size-3.5" />
+                <span className="flex-1">Project</span>
+                {(projectFilters.length > 0 || includeNoProject) && (
+                  <span className="text-xs text-primary font-medium">
+                    {projectFilters.length + (includeNoProject ? 1 : 0)}
+                  </span>
+                )}
+              </DropdownMenuSubTrigger>
+              <DropdownMenuSubContent className="w-auto min-w-52 p-0">
+                <ProjectSubContent
+                  counts={counts.project}
+                  selected={projectFilters}
+                  onToggle={act.toggleProjectFilter}
+                  includeNoProject={includeNoProject}
+                  onToggleNoProject={act.toggleNoProject}
+                  noProjectCount={counts.noProject}
+                />
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
+
+            {/* Label */}
+            <DropdownMenuSub>
+              <DropdownMenuSubTrigger>
+                <Tag className="size-3.5" />
+                <span className="flex-1">Label</span>
+                {labelFilters.length > 0 && (
+                  <span className="text-xs text-primary font-medium">
+                    {labelFilters.length}
+                  </span>
+                )}
+              </DropdownMenuSubTrigger>
+              <DropdownMenuSubContent className="w-auto min-w-52 p-0">
+                <LabelSubContent
+                  counts={counts.label}
+                  selected={labelFilters}
+                  onToggle={act.toggleLabelFilter}
                 />
               </DropdownMenuSubContent>
             </DropdownMenuSub>

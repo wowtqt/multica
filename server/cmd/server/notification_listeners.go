@@ -66,9 +66,20 @@ func parseMentions(content string) []mention {
 	return result
 }
 
+// parentBubbleNotifTypes is the allowlist of inbox notification types that
+// bubble up from a sub-issue to subscribers of its parent. Other event types
+// only notify subscribers of the sub-issue itself, to keep parent watchers'
+// inboxes focused on the signal that matters most: status transitions.
+var parentBubbleNotifTypes = map[string]bool{
+	"status_changed": true,
+}
+
 // notifySubscribers queries the subscriber table for an issue, excludes the
 // actor and any extra IDs, and creates inbox items for each remaining member
 // subscriber. Publishes an inbox:new event for each notification.
+// If the issue has a parent and the notification type is in the bubble
+// allowlist, parent issue subscribers are also notified (deduplicated
+// against direct subscribers).
 func notifySubscribers(
 	ctx context.Context,
 	queries *db.Queries,
@@ -84,11 +95,71 @@ func notifySubscribers(
 	body string,
 	details []byte,
 ) {
-	subs, err := queries.ListIssueSubscribers(ctx, parseUUID(issueID))
+	notified := notifyIssueSubscribers(ctx, queries, bus,
+		issueID, issueID, issueStatus, workspaceID, e, exclude,
+		notifType, severity, title, body, details)
+
+	// Only a small allowlist of event types bubbles to parent subscribers.
+	if !parentBubbleNotifTypes[notifType] {
+		return
+	}
+
+	// Also notify parent issue subscribers if this is a sub-issue.
+	issue, err := queries.GetIssue(ctx, parseUUID(issueID))
 	if err != nil {
-		slog.Error("failed to list subscribers for notification",
+		slog.Error("failed to get issue for parent notification",
 			"issue_id", issueID, "error", err)
 		return
+	}
+	if !issue.ParentIssueID.Valid {
+		return
+	}
+
+	// Merge already-notified IDs into exclude set for parent subscribers.
+	parentExclude := make(map[string]bool, len(exclude)+len(notified))
+	for id := range exclude {
+		parentExclude[id] = true
+	}
+	for id := range notified {
+		parentExclude[id] = true
+	}
+
+	// Query subscribers from the parent issue, but the inbox item still
+	// points to the sub-issue so the user navigates to the actual change.
+	parentID := util.UUIDToString(issue.ParentIssueID)
+	notifyIssueSubscribers(ctx, queries, bus,
+		parentID, issueID, issueStatus, workspaceID, e, parentExclude,
+		notifType, severity, title, body, details)
+}
+
+// notifyIssueSubscribers sends inbox notifications to subscribers of
+// subscriberIssueID, but creates inbox items pointing to targetIssueID.
+// This allows querying subscribers from a parent issue while the notification
+// links to the sub-issue where the change actually occurred.
+// Returns the set of member IDs that were notified.
+func notifyIssueSubscribers(
+	ctx context.Context,
+	queries *db.Queries,
+	bus *events.Bus,
+	subscriberIssueID string,
+	targetIssueID string,
+	issueStatus string,
+	workspaceID string,
+	e events.Event,
+	exclude map[string]bool,
+	notifType string,
+	severity string,
+	title string,
+	body string,
+	details []byte,
+) map[string]bool {
+	notified := map[string]bool{}
+
+	subs, err := queries.ListIssueSubscribers(ctx, parseUUID(subscriberIssueID))
+	if err != nil {
+		slog.Error("failed to list subscribers for notification",
+			"issue_id", subscriberIssueID, "error", err)
+		return notified
 	}
 
 	for _, sub := range subs {
@@ -115,7 +186,7 @@ func notifySubscribers(
 			RecipientID:   sub.UserID,
 			Type:          notifType,
 			Severity:      severity,
-			IssueID:       parseUUID(issueID),
+			IssueID:       parseUUID(targetIssueID),
 			Title:         title,
 			Body:          util.StrToText(body),
 			ActorType:     util.StrToText(e.ActorType),
@@ -128,6 +199,7 @@ func notifySubscribers(
 			continue
 		}
 
+		notified[subID] = true
 		resp := inboxItemToResponse(item)
 		resp["issue_status"] = issueStatus
 		bus.Publish(events.Event{
@@ -138,6 +210,8 @@ func notifySubscribers(
 			Payload:     map[string]any{"item": resp},
 		})
 	}
+
+	return notified
 }
 
 // notifyDirect creates an inbox item for a specific recipient. Skips if the

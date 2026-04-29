@@ -1,14 +1,16 @@
 "use client";
 
-import { User, Palette, Key, Settings, Users, FolderGit2 } from "lucide-react";
+import React from "react";
+import { User, Palette, Key, Settings, Users, FolderGit2, FlaskConical } from "lucide-react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@multica/ui/components/ui/tabs";
-import { useWorkspaceStore } from "@multica/core/workspace";
+import { useCurrentWorkspace } from "@multica/core/paths";
 import { AccountTab } from "./account-tab";
 import { AppearanceTab } from "./appearance-tab";
 import { TokensTab } from "./tokens-tab";
 import { WorkspaceTab } from "./workspace-tab";
 import { MembersTab } from "./members-tab";
 import { RepositoriesTab } from "./repositories-tab";
+import { LabsTab } from "./labs-tab";
 
 const accountTabs = [
   { value: "profile", label: "Profile", icon: User },
@@ -19,11 +21,24 @@ const accountTabs = [
 const workspaceTabs = [
   { value: "workspace", label: "General", icon: Settings },
   { value: "repositories", label: "Repositories", icon: FolderGit2 },
+  { value: "labs", label: "Labs", icon: FlaskConical },
   { value: "members", label: "Members", icon: Users },
 ];
 
-export function SettingsPage() {
-  const workspaceName = useWorkspaceStore((s) => s.workspace?.name);
+export interface ExtraSettingsTab {
+  value: string;
+  label: string;
+  icon: React.ComponentType<{ className?: string }>;
+  content: React.ReactNode;
+}
+
+interface SettingsPageProps {
+  /** Additional tabs injected by platform (e.g. desktop daemon settings) */
+  extraAccountTabs?: ExtraSettingsTab[];
+}
+
+export function SettingsPage({ extraAccountTabs }: SettingsPageProps = {}) {
+  const workspaceName = useCurrentWorkspace()?.name;
 
   return (
     <Tabs defaultValue="profile" orientation="vertical" className="flex-1 min-h-0 gap-0">
@@ -36,6 +51,12 @@ export function SettingsPage() {
             My Account
           </span>
           {accountTabs.map((tab) => (
+            <TabsTrigger key={tab.value} value={tab.value}>
+              <tab.icon className="h-4 w-4" />
+              {tab.label}
+            </TabsTrigger>
+          ))}
+          {extraAccountTabs?.map((tab) => (
             <TabsTrigger key={tab.value} value={tab.value}>
               <tab.icon className="h-4 w-4" />
               {tab.label}
@@ -63,7 +84,11 @@ export function SettingsPage() {
           <TabsContent value="tokens"><TokensTab /></TabsContent>
           <TabsContent value="workspace"><WorkspaceTab /></TabsContent>
           <TabsContent value="repositories"><RepositoriesTab /></TabsContent>
+          <TabsContent value="labs"><LabsTab /></TabsContent>
           <TabsContent value="members"><MembersTab /></TabsContent>
+          {extraAccountTabs?.map((tab) => (
+            <TabsContent key={tab.value} value={tab.value}>{tab.content}</TabsContent>
+          ))}
         </div>
       </div>
     </Tabs>

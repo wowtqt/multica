@@ -1,13 +1,17 @@
 "use client";
 
-import { useCallback, useEffect, useRef } from "react";
+import React, { useCallback, useEffect, useMemo, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Minus, Maximize2, Minimize2, Send, ChevronDown, Bot, Plus, History } from "lucide-react";
-import { Avatar, AvatarFallback, AvatarImage } from "@multica/ui/components/ui/avatar";
+import { Minus, Maximize2, Minimize2, ChevronDown, Plus, Check } from "lucide-react";
+import { Button } from "@multica/ui/components/ui/button";
+import { Tooltip, TooltipTrigger, TooltipContent } from "@multica/ui/components/ui/tooltip";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@multica/ui/components/ui/dropdown-menu";
 import { useWorkspaceId } from "@multica/core/hooks";
@@ -15,48 +19,67 @@ import { useAuthStore } from "@multica/core/auth";
 import { agentListOptions, memberListOptions } from "@multica/core/workspace/queries";
 import { canAssignAgent } from "@multica/views/issues/components";
 import { api } from "@multica/core/api";
+import { useAgentPresenceDetail } from "@multica/core/agents";
+import { ActorAvatar } from "../../common/actor-avatar";
+import { OfflineBanner } from "./offline-banner";
 import {
   chatSessionsOptions,
   allChatSessionsOptions,
   chatMessagesOptions,
+  pendingChatTaskOptions,
+  pendingChatTasksOptions,
   chatKeys,
 } from "@multica/core/chat/queries";
-import { useCreateChatSession } from "@multica/core/chat/mutations";
+import { useCreateChatSession, useMarkChatSessionRead } from "@multica/core/chat/mutations";
 import { useChatStore } from "@multica/core/chat";
-import { ChatMessageList } from "./chat-message-list";
+import { ChatMessageList, ChatMessageSkeleton } from "./chat-message-list";
 import { ChatInput } from "./chat-input";
-import { ChatSessionHistory } from "./chat-session-history";
-import { useWS } from "@multica/core/realtime";
-import type { TaskMessagePayload, ChatDonePayload, Agent, ChatMessage } from "@multica/core/types";
+import {
+  ContextAnchorButton,
+  ContextAnchorCard,
+  buildAnchorMarkdown,
+  useRouteAnchorCandidate,
+} from "./context-anchor";
+import { ChatResizeHandles } from "./chat-resize-handles";
+import { useChatResize } from "./use-chat-resize";
+import { createLogger } from "@multica/core/logger";
+import type { Agent, ChatMessage, ChatPendingTask, ChatSession } from "@multica/core/types";
+
+const uiLogger = createLogger("chat.ui");
+const apiLogger = createLogger("chat.api");
 
 export function ChatWindow() {
   const wsId = useWorkspaceId();
   const isOpen = useChatStore((s) => s.isOpen);
-  const isFullscreen = useChatStore((s) => s.isFullscreen);
   const activeSessionId = useChatStore((s) => s.activeSessionId);
-  const pendingTaskId = useChatStore((s) => s.pendingTaskId);
-  const timelineItems = useChatStore((s) => s.timelineItems);
   const selectedAgentId = useChatStore((s) => s.selectedAgentId);
   const setOpen = useChatStore((s) => s.setOpen);
-  const toggleFullscreen = useChatStore((s) => s.toggleFullscreen);
-  const showHistory = useChatStore((s) => s.showHistory);
   const setActiveSession = useChatStore((s) => s.setActiveSession);
-  const setPendingTask = useChatStore((s) => s.setPendingTask);
-  const addTimelineItem = useChatStore((s) => s.addTimelineItem);
-  const clearTimeline = useChatStore((s) => s.clearTimeline);
   const setSelectedAgentId = useChatStore((s) => s.setSelectedAgentId);
-  const setShowHistory = useChatStore((s) => s.setShowHistory);
-
   const user = useAuthStore((s) => s.user);
   const { data: agents = [] } = useQuery(agentListOptions(wsId));
   const { data: members = [] } = useQuery(memberListOptions(wsId));
   const { data: sessions = [] } = useQuery(chatSessionsOptions(wsId));
   const { data: allSessions = [] } = useQuery(allChatSessionsOptions(wsId));
-  const { data: rawMessages } = useQuery(
+  const { data: rawMessages, isLoading: messagesLoading } = useQuery(
     chatMessagesOptions(activeSessionId ?? ""),
   );
   // When no active session, always show empty — don't use stale cache
   const messages = activeSessionId ? rawMessages ?? [] : [];
+  // Skeleton only shows for an un-cached session fetch. Cached switches
+  // return data synchronously — no flash. `enabled: false` (new chat)
+  // keeps isLoading false so the starter prompts aren't hidden.
+  const showSkeleton = !!activeSessionId && messagesLoading;
+
+  // Server-authoritative pending task. Survives refresh / reopen / session
+  // switch because it's keyed on sessionId in the Query cache; WS events
+  // (chat:message / chat:done / task:*) keep it invalidated in real time.
+  //
+  // This is the SOLE source for pendingTaskId — no mirror in the store.
+  const { data: pendingTask } = useQuery(
+    pendingChatTaskOptions(activeSessionId ?? ""),
+  );
+  const pendingTaskId = pendingTask?.task_id ?? null;
 
   // Check if current session is archived
   const currentSession = activeSessionId
@@ -66,6 +89,7 @@ export function ChatWindow() {
 
   const qc = useQueryClient();
   const createSession = useCreateChatSession();
+  const markRead = useMarkChatSessionRead();
 
   const currentMember = members.find((m) => m.user_id === user?.id);
   const memberRole = currentMember?.role;
@@ -79,299 +103,638 @@ export function ChatWindow() {
     availableAgents[0] ??
     null;
 
-  // Auto-restore most recent active session from server (only once on mount)
-  const didRestoreRef = useRef(false);
+  // Presence drives both the avatar status dot (via ActorAvatar) and the
+  // OfflineBanner / TaskStatusPill availability copy. `useAgentPresenceDetail`
+  // returns "loading" while queries are still resolving — pass `undefined`
+  // downstream so banners and pill copy stay silent during loading rather
+  // than flash speculative offline text.
+  const presenceDetail = useAgentPresenceDetail(wsId, activeAgent?.id);
+  const availability =
+    presenceDetail === "loading" ? undefined : presenceDetail.availability;
+
+  // Mount / unmount logging. ChatWindow lives in DashboardLayout, so this
+  // fires on layout mount (login / workspace switch / fresh page load).
   useEffect(() => {
-    if (didRestoreRef.current) return;
-    didRestoreRef.current = true;
-    if (activeSessionId || sessions.length === 0) return;
-    const latest = sessions.find((s) => s.status === "active");
-    if (latest) {
-      setActiveSession(latest.id);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- run once when sessions load
-  }, [sessions]);
-
-  // Use ref for pendingTaskId so WS handlers always see the latest value
-  // without needing to re-subscribe on every change.
-  const pendingTaskRef = useRef<string | null>(pendingTaskId);
-  pendingTaskRef.current = pendingTaskId;
-
-  const { subscribe } = useWS();
-
-  useEffect(() => {
-    // Returns true if the event was for our pending task and was handled.
-    // Caller still decides whether to invalidate cache (chat:done / completed do; failed doesn't).
-    const matchesPending = (taskId: string) =>
-      !!pendingTaskRef.current && taskId === pendingTaskRef.current;
-
-    const finalizePending = (invalidateCache: boolean) => {
-      if (invalidateCache) {
-        const sid = useChatStore.getState().activeSessionId;
-        if (sid) {
-          qc.invalidateQueries({ queryKey: chatKeys.messages(sid) });
-        }
-      }
-      clearTimeline();
-      setPendingTask(null);
-    };
-
-    const unsubMessage = subscribe("task:message", (payload) => {
-      const p = payload as TaskMessagePayload;
-      if (!matchesPending(p.task_id)) return;
-      addTimelineItem({
-        seq: p.seq,
-        type: p.type,
-        tool: p.tool,
-        content: p.content,
-        input: p.input,
-        output: p.output,
-      });
+    uiLogger.info("ChatWindow mount", {
+      isOpen,
+      activeSessionId,
+      pendingTaskId,
+      selectedAgentId,
+      wsId,
     });
-
-    const unsubDone = subscribe("chat:done", (payload) => {
-      const p = payload as ChatDonePayload;
-      if (!matchesPending(p.task_id)) return;
-      finalizePending(true);
-    });
-
-    const unsubCompleted = subscribe("task:completed", (payload) => {
-      const p = payload as { task_id: string };
-      if (!matchesPending(p.task_id)) return;
-      finalizePending(true);
-    });
-
-    const unsubFailed = subscribe("task:failed", (payload) => {
-      const p = payload as { task_id: string };
-      if (!matchesPending(p.task_id)) return;
-      finalizePending(false);
-    });
-
     return () => {
-      unsubMessage();
-      unsubDone();
-      unsubCompleted();
-      unsubFailed();
+      uiLogger.info("ChatWindow unmount", {
+        activeSessionId,
+        pendingTaskId,
+      });
     };
-  }, [subscribe, addTimelineItem, clearTimeline, setPendingTask, qc]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- once per mount
+  }, []);
+
+  // Open intent is fully driven by `activeSessionId` in storage — no mount
+  // restore, no self-heal. Adding either reintroduces a "two signals
+  // describing one fact" race (the previous self-heal mis-cleared the
+  // freshly-created session because allSessions was still stale during the
+  // post-create invalidate-refetch window).
+
+  // WS events are handled globally in useRealtimeSync — the query cache
+  // stays current even when this window is closed. See packages/core/realtime/.
+
+  // Auto mark-as-read whenever the user is looking at a session with unread
+  // state: window open + a session active + has_unread → PATCH.
+  // has_unread comes from the list query; WS handlers invalidate it on
+  // chat:done so a reply arriving while the user watches triggers this
+  // effect again and is instantly cleared.
+  const currentHasUnread =
+    sessions.find((s) => s.id === activeSessionId)?.has_unread ?? false;
+  useEffect(() => {
+    if (!isOpen || !activeSessionId) return;
+    if (!currentHasUnread) return;
+    uiLogger.info("auto markRead", { sessionId: activeSessionId });
+    markRead.mutate(activeSessionId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- markRead ref stable
+  }, [isOpen, activeSessionId, currentHasUnread]);
+
+  // Focus-mode anchor: derived from route each render. Prepended to the
+  // outgoing message when focus is on; the anchor persists across sends
+  // (focus mode tracks the user's page, not a per-message attachment).
+  const { candidate: anchorCandidate } = useRouteAnchorCandidate(wsId);
 
   const handleSend = useCallback(
     async (content: string) => {
-      if (!activeAgent) return;
+      if (!activeAgent) {
+        apiLogger.warn("sendChatMessage skipped: no active agent");
+        return;
+      }
+
+      const focusOn = useChatStore.getState().focusMode;
+      const finalContent = focusOn && anchorCandidate
+        ? `${buildAnchorMarkdown(anchorCandidate)}\n\n${content}`
+        : content;
 
       let sessionId = activeSessionId;
+      const isNewSession = !sessionId;
+
+      apiLogger.info("sendChatMessage.start", {
+        sessionId,
+        isNewSession,
+        agentId: activeAgent.id,
+        contentLength: finalContent.length,
+        hasAnchor: focusOn && !!anchorCandidate,
+      });
 
       if (!sessionId) {
         const session = await createSession.mutateAsync({
           agent_id: activeAgent.id,
-          title: content.slice(0, 50),
+          title: finalContent.slice(0, 50),
         });
         sessionId = session.id;
         setActiveSession(sessionId);
       }
 
-      // Optimistic: show user message immediately.
+      // Optimistic burst — everything that gives the user "I sent a message
+      // and the agent is now working" feedback fires BEFORE the HTTP roundtrip.
+      // Pre-#status-pill the pending-task seed lived after `await
+      // sendChatMessage` and the pill blinked in a few hundred ms after the
+      // user's message — small but visible "did it actually send?" gap.
+      const sentAt = new Date().toISOString();
       const optimistic: ChatMessage = {
         id: `optimistic-${Date.now()}`,
         chat_session_id: sessionId,
         role: "user",
-        content,
+        content: finalContent,
         task_id: null,
-        created_at: new Date().toISOString(),
+        created_at: sentAt,
       };
       qc.setQueryData<ChatMessage[]>(
         chatKeys.messages(sessionId),
         (old) => (old ? [...old, optimistic] : [optimistic]),
       );
+      // Seed the pending-task with a temporary id so the StatusPill mounts
+      // and starts ticking the instant the user clicks send. Real task_id
+      // and server-authoritative created_at land below; until then the pill
+      // is anchored to the local clock (drift is the request RTT, ~50–200ms,
+      // which doesn't change the rendered "Ns" value).
+      qc.setQueryData<ChatPendingTask>(chatKeys.pendingTask(sessionId), {
+        task_id: `optimistic-${optimistic.id}`,
+        status: "queued",
+        created_at: sentAt,
+      });
+      apiLogger.debug("sendChatMessage.optimistic", { sessionId, optimisticId: optimistic.id });
 
-      const result = await api.sendChatMessage(sessionId, content);
-      setPendingTask(result.task_id);
+      const result = await api.sendChatMessage(sessionId, finalContent);
+      apiLogger.info("sendChatMessage.success", {
+        sessionId,
+        messageId: result.message_id,
+        taskId: result.task_id,
+      });
+      // Replace the temporary task_id with the server's real one (so the WS
+      // task: handlers can match against it) and snap the anchor to the
+      // server's created_at — keeping the elapsed-seconds reading stable.
+      qc.setQueryData<ChatPendingTask>(chatKeys.pendingTask(sessionId), {
+        task_id: result.task_id,
+        status: "queued",
+        created_at: result.created_at,
+      });
       qc.invalidateQueries({ queryKey: chatKeys.messages(sessionId) });
     },
     [
       activeSessionId,
       activeAgent,
+      anchorCandidate,
       createSession,
       setActiveSession,
-      setPendingTask,
       qc,
     ],
   );
 
-  const handleStop = useCallback(async () => {
-    if (!pendingTaskId) return;
-    try {
-      await api.cancelTaskById(pendingTaskId);
-    } catch {
-      // Task may already be completed
+  const handleStop = useCallback(() => {
+    if (!pendingTaskId || !activeSessionId) {
+      apiLogger.debug("cancelTask skipped: no pending task");
+      return;
     }
-    if (activeSessionId) {
-      qc.invalidateQueries({ queryKey: chatKeys.messages(activeSessionId) });
-    }
-    clearTimeline();
-    setPendingTask(null);
-  }, [pendingTaskId, activeSessionId, clearTimeline, setPendingTask, qc]);
+    // Optimistic clear — pill disappears + input unlocks the moment the
+    // user clicks Stop, instead of after the HTTP roundtrip. WS
+    // task:cancelled will confirm later (no-op if cache is already empty);
+    // if the cancel POST fails because the task already finished, the
+    // assistant message arrives via task:completed → chat:done and renders
+    // normally. Either way the UI is in sync with reality without latency.
+    apiLogger.info("cancelTask.start", { taskId: pendingTaskId, sessionId: activeSessionId });
+    qc.setQueryData(chatKeys.pendingTask(activeSessionId), {});
+    qc.invalidateQueries({ queryKey: chatKeys.messages(activeSessionId) });
+    // Fire-and-forget — UI is already in its post-cancel state. We log the
+    // outcome but never block on it.
+    api.cancelTaskById(pendingTaskId).then(
+      () => apiLogger.info("cancelTask.success", { taskId: pendingTaskId }),
+      (err) =>
+        apiLogger.warn("cancelTask.error (task may have already finished)", {
+          taskId: pendingTaskId,
+          err,
+        }),
+    );
+  }, [pendingTaskId, activeSessionId, qc]);
 
   const handleSelectAgent = useCallback(
     (agent: Agent) => {
+      // No-op when clicking the already-active agent — don't clobber the
+      // current session just because the user closed the menu this way.
+      // Compare against activeAgent (what the UI shows), not selectedAgentId
+      // (which may be null / point to an archived agent on first load).
+      if (activeAgent && agent.id === activeAgent.id) return;
+      uiLogger.info("selectAgent", {
+        from: selectedAgentId,
+        to: agent.id,
+        previousSessionId: activeSessionId,
+      });
       setSelectedAgentId(agent.id);
       // Reset session when switching agent
       setActiveSession(null);
     },
-    [setSelectedAgentId, setActiveSession],
+    [activeAgent, selectedAgentId, activeSessionId, setSelectedAgentId, setActiveSession],
   );
 
-  if (!isOpen) return null;
+  const handleNewChat = useCallback(() => {
+    uiLogger.info("newChat", {
+      previousSessionId: activeSessionId,
+      previousPendingTask: pendingTaskId,
+    });
+    setActiveSession(null);
+  }, [activeSessionId, pendingTaskId, setActiveSession]);
 
-  const hasMessages = messages.length > 0 || timelineItems.length > 0;
+  const handleSelectSession = useCallback(
+    (session: ChatSession) => {
+      // Sessions are bound 1:1 to an agent — picking a session from a
+      // different agent implicitly switches the agent too.
+      if (activeAgent && session.agent_id !== activeAgent.id) {
+        uiLogger.info("selectSession (cross-agent)", {
+          from: activeAgent.id,
+          toAgent: session.agent_id,
+          toSession: session.id,
+        });
+        setSelectedAgentId(session.agent_id);
+      }
+      setActiveSession(session.id);
+    },
+    [activeAgent, setSelectedAgentId, setActiveSession],
+  );
 
-  const containerClass = isFullscreen
-    ? "fixed inset-y-0 right-0 z-50 flex flex-col w-[50%] border-l bg-background shadow-2xl"
-    : "fixed bottom-4 right-4 z-50 flex flex-col w-[420px] h-[600px] rounded-xl border bg-background shadow-2xl overflow-hidden";
+  const handleMinimize = useCallback(() => {
+    uiLogger.info("minimize (close)", {
+      activeSessionId,
+      pendingTaskId,
+    });
+    setOpen(false);
+  }, [activeSessionId, pendingTaskId, setOpen]);
+
+  const windowRef = useRef<HTMLDivElement>(null);
+  const { renderWidth, renderHeight, isAtMax, boundsReady, isDragging, toggleExpand, startDrag } = useChatResize(windowRef);
+
+  // Show the list (vs empty state) as soon as there's anything to display —
+  // a real message, or a pending task whose timeline will stream in.
+  const hasMessages = messages.length > 0 || !!pendingTaskId;
+
+  const isVisible = isOpen && boundsReady;
+
+  const containerClass = "absolute bottom-2 right-2 z-50 flex flex-col rounded-xl ring-1 ring-foreground/10 bg-sidebar shadow-2xl overflow-hidden";
+  const containerStyle: React.CSSProperties = {
+    width: `${renderWidth}px`,
+    height: `${renderHeight}px`,
+    opacity: isVisible ? 1 : 0,
+    transform: isVisible ? "scale(1)" : "scale(0.95)",
+    transformOrigin: "bottom right",
+    pointerEvents: isOpen ? "auto" : "none",
+    transition: isDragging
+      ? "none"
+      : "width 200ms ease-out, height 200ms ease-out, opacity 150ms ease-out, transform 150ms ease-out",
+  };
 
   return (
-    <div className={containerClass}>
-      {/* Header */}
-      {!showHistory && (
-        <div className="flex items-center justify-between border-b px-4 py-2.5">
-          <AgentSelector
+    <div ref={windowRef} className={containerClass} style={containerStyle}>
+      <ChatResizeHandles onDragStart={startDrag} />
+      {/* Header — ⊕ new + session dropdown | window tools */}
+      <div className="flex items-center justify-between border-b px-4 py-2.5 gap-2">
+        <div className="flex items-center gap-1 min-w-0">
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  className="rounded-full text-muted-foreground"
+                  onClick={handleNewChat}
+                />
+              }
+            >
+              <Plus />
+            </TooltipTrigger>
+            <TooltipContent side="top">New chat</TooltipContent>
+          </Tooltip>
+          <SessionDropdown
+            sessions={sessions}
+            // Use the full agent list (incl. archived) so historical
+            // sessions can still resolve their avatar.
+            agents={agents}
+            activeSessionId={activeSessionId}
+            onSelectSession={handleSelectSession}
+          />
+        </div>
+        <div className="flex items-center gap-0.5 shrink-0">
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  className="text-muted-foreground"
+                  onClick={toggleExpand}
+                />
+              }
+            >
+              {isAtMax ? <Minimize2 /> : <Maximize2 />}
+            </TooltipTrigger>
+            <TooltipContent side="top">
+              {isAtMax ? "Restore" : "Expand"}
+            </TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  className="text-muted-foreground"
+                  onClick={handleMinimize}
+                />
+              }
+            >
+              <Minus />
+            </TooltipTrigger>
+            <TooltipContent side="top">Minimize</TooltipContent>
+          </Tooltip>
+        </div>
+      </div>
+
+      {/* Messages / skeleton / empty state */}
+      {showSkeleton ? (
+        <ChatMessageSkeleton />
+      ) : hasMessages ? (
+        <ChatMessageList
+          messages={messages}
+          pendingTask={pendingTask}
+          availability={availability}
+          onCancel={handleStop}
+        />
+      ) : (
+        <EmptyState
+          agentName={activeAgent?.name}
+          onPickPrompt={(text) => handleSend(text)}
+        />
+      )}
+
+      {/* Presence banner sits above the input card (not inside topSlot) so
+       *  the "offline / unstable" hint reads as a global session signal,
+       *  not an attachment to the message being composed. ContextAnchorCard
+       *  stays in topSlot because that's per-message context. */}
+      <OfflineBanner agentName={activeAgent?.name} availability={availability} />
+
+      {/* Input — disabled for archived sessions */}
+      <ChatInput
+        onSend={handleSend}
+        onStop={handleStop}
+        isRunning={!!pendingTaskId}
+        disabled={isSessionArchived}
+        agentName={activeAgent?.name}
+        topSlot={<ContextAnchorCard />}
+        leftAdornment={
+          <AgentDropdown
             agents={availableAgents}
             activeAgent={activeAgent}
+            userId={user?.id}
             onSelect={handleSelectAgent}
           />
-          <div className="flex items-center gap-0.5">
-            <button
-              onClick={() => setShowHistory(true)}
-              title="Chat history"
-              className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
-            >
-              <History className="size-3.5" />
-            </button>
-            <button
-              onClick={() => {
-                setActiveSession(null);
-                clearTimeline();
-                setPendingTask(null);
-              }}
-              title="New chat"
-              className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
-            >
-              <Plus className="size-3.5" />
-            </button>
-            <button
-              onClick={toggleFullscreen}
-              title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
-              className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
-            >
-              {isFullscreen ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}
-            </button>
-            <button
-              onClick={() => setOpen(false)}
-              title="Minimize"
-              className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
-            >
-              <Minus className="size-3.5" />
-            </button>
-          </div>
-        </div>
-      )}
-
-      {showHistory ? (
-        <ChatSessionHistory />
-      ) : (
-        <>
-          {/* Messages or Empty State */}
-          {hasMessages ? (
-            <ChatMessageList
-              messages={messages}
-              agent={activeAgent}
-              timelineItems={timelineItems}
-              isWaiting={!!pendingTaskId}
-            />
-          ) : (
-            <EmptyState agentName={activeAgent?.name} />
-          )}
-
-          {/* Input — disabled for archived sessions */}
-          <ChatInput
-            onSend={handleSend}
-            onStop={handleStop}
-            isRunning={!!pendingTaskId}
-            disabled={isSessionArchived}
-          />
-        </>
-      )}
+        }
+        rightAdornment={<ContextAnchorButton />}
+      />
     </div>
   );
 }
 
-function AgentSelector({
+/**
+ * Agent dropdown: avatar trigger, lists all available agents. Selecting a
+ * different agent = switch agent + start a fresh chat (session=null).
+ * The current agent is marked with a check and not clickable.
+ */
+function AgentDropdown({
   agents,
   activeAgent,
+  userId,
   onSelect,
 }: {
   agents: Agent[];
   activeAgent: Agent | null;
+  userId: string | undefined;
   onSelect: (agent: Agent) => void;
 }) {
-  if (!activeAgent) {
-    return <span className="text-sm text-muted-foreground">No agents</span>;
-  }
+  // Split into the user's own agents and everyone else so the menu groups
+  // them — matches the old AgentSelector layout.
+  const { mine, others } = useMemo(() => {
+    const mine: Agent[] = [];
+    const others: Agent[] = [];
+    for (const a of agents) {
+      if (a.owner_id === userId) mine.push(a);
+      else others.push(a);
+    }
+    return { mine, others };
+  }, [agents, userId]);
 
-  if (agents.length <= 1) {
-    return (
-      <div className="flex items-center gap-2">
-        <AgentAvatarSmall agent={activeAgent} />
-        <span className="text-sm font-medium">{activeAgent.name}</span>
-      </div>
-    );
+  if (!activeAgent) {
+    return <span className="text-xs text-muted-foreground">No agents</span>;
   }
 
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger className="flex items-center gap-2 rounded-md px-1.5 py-1 -ml-1.5 transition-colors hover:bg-accent">
-        <AgentAvatarSmall agent={activeAgent} />
-        <span className="text-sm font-medium">{activeAgent.name}</span>
-        <ChevronDown className="size-3 text-muted-foreground" />
+      <DropdownMenuTrigger className="flex items-center gap-1.5 rounded-md px-1.5 py-1 -ml-1 cursor-pointer outline-none transition-colors hover:bg-accent aria-expanded:bg-accent">
+        <ActorAvatar
+          actorType="agent"
+          actorId={activeAgent.id}
+          size={24}
+          enableHoverCard
+          showStatusDot
+        />
+        <span className="text-xs font-medium max-w-28 truncate">{activeAgent.name}</span>
+        <ChevronDown className="size-3 text-muted-foreground shrink-0" />
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="start">
-        {agents.map((agent) => (
-          <DropdownMenuItem
-            key={agent.id}
-            onClick={() => onSelect(agent)}
-            className="flex items-center gap-2"
-          >
-            <AgentAvatarSmall agent={agent} />
-            <span>{agent.name}</span>
-          </DropdownMenuItem>
-        ))}
+      <DropdownMenuContent align="start" side="top" className="max-h-80 w-auto max-w-64">
+        {mine.length > 0 && (
+          <DropdownMenuGroup>
+            <DropdownMenuLabel>My agents</DropdownMenuLabel>
+            {mine.map((agent) => (
+              <AgentMenuItem
+                key={agent.id}
+                agent={agent}
+                isCurrent={agent.id === activeAgent.id}
+                onSelect={onSelect}
+              />
+            ))}
+          </DropdownMenuGroup>
+        )}
+        {mine.length > 0 && others.length > 0 && <DropdownMenuSeparator />}
+        {others.length > 0 && (
+          <DropdownMenuGroup>
+            <DropdownMenuLabel>Others</DropdownMenuLabel>
+            {others.map((agent) => (
+              <AgentMenuItem
+                key={agent.id}
+                agent={agent}
+                isCurrent={agent.id === activeAgent.id}
+                onSelect={onSelect}
+              />
+            ))}
+          </DropdownMenuGroup>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );
 }
 
-function AgentAvatarSmall({ agent }: { agent: Agent }) {
+function AgentMenuItem({
+  agent,
+  isCurrent,
+  onSelect,
+}: {
+  agent: Agent;
+  isCurrent: boolean;
+  onSelect: (agent: Agent) => void;
+}) {
   return (
-    <Avatar className="size-5">
-      {agent.avatar_url && <AvatarImage src={agent.avatar_url} />}
-      <AvatarFallback className="bg-purple-100 text-purple-700 text-[10px]">
-        <Bot className="size-3" />
-      </AvatarFallback>
-    </Avatar>
+    <DropdownMenuItem
+      onClick={() => onSelect(agent)}
+      className="flex min-w-0 items-center gap-2"
+    >
+      <ActorAvatar
+        actorType="agent"
+        actorId={agent.id}
+        size={24}
+        enableHoverCard
+        showStatusDot
+      />
+      <span className="truncate flex-1">{agent.name}</span>
+      {isCurrent && <Check className="size-3.5 text-muted-foreground shrink-0" />}
+    </DropdownMenuItem>
   );
 }
 
-function EmptyState({ agentName }: { agentName?: string }) {
+/**
+ * Session dropdown: lists ALL sessions across agents. Each row carries the
+ * owning agent's avatar so the user can tell them apart. Selecting a
+ * session from a different agent implicitly switches the agent too
+ * (sessions are bound 1:1 to an agent). "New chat" lives in the header's
+ * ⊕ button, not inside this dropdown.
+ */
+function SessionDropdown({
+  sessions,
+  agents,
+  activeSessionId,
+  onSelectSession,
+}: {
+  sessions: ChatSession[];
+  agents: Agent[];
+  activeSessionId: string | null;
+  onSelectSession: (session: ChatSession) => void;
+}) {
+  const wsId = useWorkspaceId();
+  const agentById = useMemo(() => new Map(agents.map((a) => [a.id, a])), [agents]);
+  const activeSession = sessions.find((s) => s.id === activeSessionId);
+  const title = activeSession?.title?.trim() || "New chat";
+  const triggerAgent = activeSession ? agentById.get(activeSession.agent_id) ?? null : null;
+
+  // Aggregate "which sessions have an in-flight task right now". Reuses
+  // the same workspace-scoped query the FAB consumes, so toggling the chat
+  // window doesn't fire a second request — TanStack dedupes by key.
+  const { data: pending } = useQuery(pendingChatTasksOptions(wsId));
+  const inFlightSessionIds = useMemo(
+    () => new Set((pending?.tasks ?? []).map((t) => t.chat_session_id)),
+    [pending],
+  );
+
+  // Cross-session aggregate signal for the closed-dropdown trigger.
+  // "Active" here means there's something interesting happening in a
+  // session OTHER than the one the user is currently looking at — the
+  // user already sees their own session's state via the StatusPill /
+  // unread auto-mark, so highlighting it on the trigger would be noise.
+  // Same priority rule as the row pips: running > unread.
+  const otherSessionRunning = sessions.some(
+    (s) => s.id !== activeSessionId && inFlightSessionIds.has(s.id),
+  );
+  const otherSessionUnread = sessions.some(
+    (s) => s.id !== activeSessionId && s.has_unread,
+  );
+
   return (
-    <div className="flex flex-1 flex-col items-center justify-center gap-4 px-8">
-      <Send className="size-8 text-muted-foreground/50" />
-      <div className="text-center">
-        <h3 className="text-base font-semibold">Welcome to Multica</h3>
-        <p className="mt-1 text-sm text-muted-foreground">
-          {agentName
-            ? `Chat with ${agentName} or ask anything`
-            : "Ask anything or tell Multica what you need"}
-        </p>
+    <DropdownMenu>
+      <DropdownMenuTrigger className="flex items-center gap-1.5 min-w-0 rounded-md px-1.5 py-1 transition-colors hover:bg-accent aria-expanded:bg-accent">
+        {triggerAgent && (
+          <ActorAvatar
+            actorType="agent"
+            actorId={triggerAgent.id}
+            size={24}
+            enableHoverCard
+            showStatusDot
+          />
+        )}
+        <span className="truncate text-sm font-medium">{title}</span>
+        {otherSessionRunning ? (
+          <span
+            aria-label="Another chat is running"
+            title="Another chat is running"
+            className="size-1.5 shrink-0 rounded-full bg-amber-500 animate-pulse"
+          />
+        ) : otherSessionUnread ? (
+          <span
+            aria-label="Another chat has unread replies"
+            title="Another chat has unread replies"
+            className="size-1.5 shrink-0 rounded-full bg-brand"
+          />
+        ) : null}
+        <ChevronDown className="size-3 text-muted-foreground shrink-0" />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="max-h-80 w-auto min-w-56 max-w-80">
+        {sessions.length === 0 ? (
+          <div className="px-2 py-1.5 text-xs text-muted-foreground">
+            No previous chats
+          </div>
+        ) : (
+          sessions.map((session) => {
+            const isCurrent = session.id === activeSessionId;
+            const agent = agentById.get(session.agent_id) ?? null;
+            const isRunning = inFlightSessionIds.has(session.id);
+            return (
+              <DropdownMenuItem
+                key={session.id}
+                onClick={() => onSelectSession(session)}
+                className="flex min-w-0 items-center gap-2"
+              >
+                {agent ? (
+                  <ActorAvatar
+                    actorType="agent"
+                    actorId={agent.id}
+                    size={24}
+                    enableHoverCard
+                    showStatusDot
+                  />
+                ) : (
+                  <span className="size-6 shrink-0" />
+                )}
+                <span className="truncate flex-1 text-sm">
+                  {session.title?.trim() || "New chat"}
+                </span>
+                {/* Right-edge status pip: in-flight wins over unread because
+                 *  "still working" is more actionable than "has reply" — and
+                 *  the two rarely coexist in practice (the unread flag fires
+                 *  on chat_message write, by which point the task has just
+                 *  finished). Same pip shape as unread for visual rhythm,
+                 *  amber + pulse to read as activity. */}
+                {isRunning ? (
+                  <span
+                    aria-label="Running"
+                    title="Running"
+                    className="size-1.5 shrink-0 rounded-full bg-amber-500 animate-pulse"
+                  />
+                ) : session.has_unread ? (
+                  <span
+                    aria-label="Unread"
+                    title="Unread"
+                    className="size-1.5 shrink-0 rounded-full bg-brand"
+                  />
+                ) : null}
+                {isCurrent && <Check className="size-3.5 text-muted-foreground shrink-0" />}
+              </DropdownMenuItem>
+            );
+          })
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+/**
+ * Three starter prompts shown on the empty state. Tapping one sends it
+ * immediately — ChatGPT-style — because the point is showing users what
+ * this chat is for: operating on the workspace, not open-ended Q&A.
+ */
+const STARTER_PROMPTS: { icon: string; text: string }[] = [
+  { icon: "📋", text: "List my open tasks by priority" },
+  { icon: "📝", text: "Summarize what I did today" },
+  { icon: "💡", text: "Plan what to work on next" },
+];
+
+function EmptyState({
+  agentName,
+  onPickPrompt,
+}: {
+  agentName?: string;
+  onPickPrompt: (text: string) => void;
+}) {
+  return (
+    <div className="flex flex-1 flex-col items-center justify-center gap-5 px-6 py-8">
+      <div className="text-center space-y-1">
+        <h3 className="text-base font-semibold">
+          {agentName ? `Hi, I'm ${agentName}` : "Welcome to Multica"}
+        </h3>
+        <p className="text-sm text-muted-foreground">Try asking</p>
+      </div>
+      <div className="w-full max-w-xs space-y-2">
+        {STARTER_PROMPTS.map((prompt) => (
+          <button
+            key={prompt.text}
+            type="button"
+            onClick={() => onPickPrompt(prompt.text)}
+            className="w-full rounded-lg border border-border bg-card px-3 py-2 text-left text-sm text-foreground transition-colors hover:bg-accent hover:border-brand/40"
+          >
+            <span className="mr-2">{prompt.icon}</span>
+            {prompt.text}
+          </button>
+        ))}
       </div>
     </div>
   );

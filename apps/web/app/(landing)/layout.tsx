@@ -30,7 +30,7 @@ const jsonLd = {
       applicationCategory: "ProjectManagement",
       operatingSystem: "Web",
       description:
-        "AI-native task management platform that turns coding agents into real teammates.",
+        "Open-source project management platform that turns coding agents into real teammates.",
       offers: {
         "@type": "Offer",
         price: "0",
@@ -67,7 +67,7 @@ export default async function LandingLayout({
         type="application/ld+json"
         dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
       />
-      <div className={`${instrumentSerif.variable} ${notoSerifSC.variable} h-full overflow-x-hidden overflow-y-auto bg-white`}>
+      <div className={`${instrumentSerif.variable} ${notoSerifSC.variable} landing-light h-full overflow-x-hidden overflow-y-auto bg-white`}>
         <LocaleProvider initialLocale={initialLocale}>{children}</LocaleProvider>
       </div>
     </>
